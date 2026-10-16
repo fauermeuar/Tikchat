@@ -1,0 +1,17 @@
+{
+  "id": "/tikchat/?pwa=tikchat",
+  "name": "TikChat — Komentar TikTok LIVE",
+  "short_name": "TikChat",
+  "description": "Pantau komentar TikTok LIVE tanpa membuka video.",
+  "lang": "id",
+  "start_url": "/tikchat/",
+  "scope": "/tikchat/",
+  "display": "standalone",
+  "background_color": "#07090f",
+  "theme_color": "#07090f",
+  "icons": [
+    {"src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+    {"src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png"},
+    {"src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ]
+}

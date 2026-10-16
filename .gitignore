@@ -1,0 +1,14 @@
+# Gradle / Android
+.gradle/
+build/
+*/build/
+local.properties
+*.apk
+*.aab
+.DS_Store
+
+# Go
+/backend/tikchat
+
+# Biner backend hasil CI (dibangun ulang tiap workflow)
+/android/app/src/main/assets/

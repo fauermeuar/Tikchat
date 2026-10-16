@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,6 +30,7 @@ jobs:
       - name: Build backend (android/arm64)
         run: |
           cd backend
+          mkdir -p ../android/app/src/main/assets/arm64-v8a
           GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
             go build -trimpath -ldflags="-s -w -X main.appVersion=v1.4.9" \
             -o ../android/app/src/main/assets/arm64-v8a/tikchat .
@@ -38,8 +42,13 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Setup Android SDK packages
+        run: |
+          # Runner sudah punya cmdline-tools; install paket yang dibutuhkan saja.
+          # (android-actions/setup-android@v3 gagal karena paket 'tools' sudah tidak ada.)
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Build debug APK
         working-directory: android

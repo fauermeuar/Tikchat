@@ -1,0 +1,166 @@
+diff --git a/config/config.go b/config/config.go
+index 678eb8aa..dc9c177e 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -78,6 +78,7 @@ type Inbound struct {
+ 	MixedPort         int            `json:"mixed-port"`
+ 	Tun               LC.Tun         `json:"tun"`
+ 	Ebpf              LC.Ebpf        `json:"ebpf"`
++	EbpfCgroup        LC.EbpfCgroup  `json:"ebpf-cgroup"`
+ 	TuicServer        LC.TuicServer  `json:"tuic-server"`
+ 	ShadowSocksConfig string         `json:"ss-config"`
+ 	VmessConfig       string         `json:"vmess-config"`
+@@ -368,6 +369,13 @@ type RawEbpfHost struct {
+ 	BypassProcesses []string `yaml:"bypass-processes" json:"bypass-processes"`
+ }
+ 
++// RawEbpfCgroup retains the cgroup-eBPF redirector settings as plain values.
++type RawEbpfCgroup struct {
++	Enable     bool   `yaml:"enable" json:"enable"`
++	RedirPort  int    `yaml:"redir-port" json:"redir-port"`
++	CgroupPath string `yaml:"cgroup-path" json:"cgroup-path"`
++}
++
+ type RawTuicServer struct {
+ 	Enable                bool              `yaml:"enable" json:"enable"`
+ 	Listen                string            `yaml:"listen" json:"listen"`
+@@ -498,6 +506,7 @@ type RawConfig struct {
+ 	NTP           RawNTP                    `yaml:"ntp" json:"ntp"`
+ 	Tun           RawTun                    `yaml:"tun" json:"tun"`
+ 	Ebpf          RawEbpf                   `yaml:"ebpf" json:"ebpf"`
++	EbpfCgroup    RawEbpfCgroup             `yaml:"ebpf-cgroup" json:"ebpf-cgroup"`
+ 	TuicServer    RawTuicServer             `yaml:"tuic-server" json:"tuic-server"`
+ 	IPTables      RawIPTables               `yaml:"iptables" json:"iptables"`
+ 	Experimental  RawExperimental           `yaml:"experimental" json:"experimental"`
+@@ -618,6 +627,10 @@ func DefaultRawConfig() *RawConfig {
+ 			BypassDSCPs:   []int{},
+ 			BypassFWMarks: []uint32{},
+ 		},
++		EbpfCgroup: RawEbpfCgroup{
++			Enable:    false,
++			RedirPort: 7891,
++		},
+ 		TuicServer: RawTuicServer{
+ 			Enable:                false,
+ 			Token:                 nil,
+@@ -833,6 +846,10 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	ebpfCgroup, err := parseEbpfCgroup(cfg.EbpfCgroup)
++	if err != nil {
++		return nil, err
++	}
+ 	if err := validateEbpfDirectProviders(ebpf.Target.DirectIPRuleProviders, cfg.Rule, cfg.RuleProvider); err != nil {
+ 		return nil, err
+ 	}
+@@ -854,6 +871,7 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
+ 			InboundTfo:        cfg.InboundTfo,
+ 			InboundMPTCP:      cfg.InboundMPTCP,
+ 			Ebpf:              ebpf,
++			EbpfCgroup:        ebpfCgroup,
+ 		},
+ 		UnifiedDelay: cfg.UnifiedDelay,
+ 		Mode:         cfg.Mode,
+@@ -1004,6 +1022,22 @@ func validateInboundConflicts(rawCfg *RawConfig) error {
+ 	return nil
+ }
+ 
++// parseEbpfCgroup validates the cgroup-eBPF redirector config. It is
++// intentionally minimal: enable + redir-port (+ optional cgroup-path).
++func parseEbpfCgroup(raw RawEbpfCgroup) (LC.EbpfCgroup, error) {
++	if !raw.Enable {
++		return LC.EbpfCgroup{}, nil
++	}
++	if raw.RedirPort < 1 || raw.RedirPort > 65535 {
++		return LC.EbpfCgroup{}, fmt.Errorf("ebpf-cgroup.redir-port must be in 1..65535: %d", raw.RedirPort)
++	}
++	return LC.EbpfCgroup{
++		Enable:     true,
++		RedirPort:  uint16(raw.RedirPort),
++		CgroupPath: raw.CgroupPath,
++	}, nil
++}
++
+ func parseEbpfPorts(field string, raw []int) ([]uint16, error) {
+ 	ports := make([]uint16, len(raw))
+ 	for i, port := range raw {
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+index ad80ce3c..65434dd1 100644
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -36,6 +36,7 @@ import (
+ 	authStore "github.com/metacubex/mihomo/listener/auth"
+ 	LC "github.com/metacubex/mihomo/listener/config"
+ 	"github.com/metacubex/mihomo/listener/ebpf"
++	"github.com/metacubex/mihomo/listener/ebpfcgroup"
+ 	"github.com/metacubex/mihomo/listener/inner"
+ 	"github.com/metacubex/mihomo/listener/tproxy"
+ 	"github.com/metacubex/mihomo/log"
+@@ -46,6 +47,8 @@ import (
+ var mux sync.Mutex
+ var ebpfInbound *ebpf.Manager
+ var ebpfConfig LC.Ebpf
++var ebpfCgroupMgr *ebpfcgroup.Manager
++var ebpfCgroupConfig LC.EbpfCgroup
+ 
+ func readConfig(path string) ([]byte, error) {
+ 	if _, err := os.Stat(path); os.IsNotExist(err) {
+@@ -115,6 +118,9 @@ func ApplyConfig(cfg *config.Config, force bool) error {
+ 	if err := updateEBPF(cfg.General.Ebpf); err != nil {
+ 		return err
+ 	}
++	if err := updateEbpfCgroup(cfg.General.EbpfCgroup); err != nil {
++		return err
++	}
+ 	updateTun(cfg.General) // tun should not care "force"
+ 	updateIPTables(cfg)
+ 	updateTunnels(cfg.Tunnels)
+@@ -177,10 +183,47 @@ func updateEBPF(config LC.Ebpf) error {
+ 	return nil
+ }
+ 
++// updateEbpfCgroup manages the cgroup-eBPF TCP redirector lifecycle.
++// It feeds the phone's own TCP traffic into mihomo's redir-port via
++// faked SO_ORIGINAL_DST, independent of the "ebpf" (PR #3175) inbound.
++func updateEbpfCgroup(config LC.EbpfCgroup) error {
++	if !config.Enable {
++		if ebpfCgroupMgr != nil {
++			err := ebpfCgroupMgr.Close()
++			ebpfCgroupMgr = nil
++			return err
++		}
++		return nil
++	}
++	if ebpfCgroupMgr != nil && ebpfCgroupConfig.Equal(config) {
++		return nil
++	}
++	if ebpfCgroupMgr != nil {
++		if err := ebpfCgroupMgr.Close(); err != nil {
++			return err
++		}
++		ebpfCgroupMgr = nil
++	}
++	manager, err := ebpfcgroup.Start(ebpfcgroup.Config{
++		Enable:     config.Enable,
++		RedirPort:  config.RedirPort,
++		CgroupPath: config.CgroupPath,
++	})
++	if err != nil {
++		return err
++	}
++	ebpfCgroupMgr = manager
++	ebpfCgroupConfig = config
++	return nil
++}
++
+ func validateConfigForPlatform(cfg *config.Config, goos string) error {
+ 	if cfg.General.Ebpf.Enable && goos != "linux" {
+ 		return fmt.Errorf("eBPF inbound requires Linux")
+ 	}
++	if cfg.General.EbpfCgroup.Enable && goos != "linux" {
++		return fmt.Errorf("ebpf-cgroup requires Linux")
++	}
+ 	return nil
+ }
+ 

@@ -1,84 +1,92 @@
-# TikChat v1.4.9 — Android APK
+# ebpf-cgroup: inbound eBPF cgroup untuk mihomo (trafik HP sendiri)
 
-Pantau + bacakan komentar TikTok LIVE tanpa membuka video (hemat kuota),
-sebagai **aplikasi Android** (bukan lagi modul Magisk).
-
-## Fitur v1.4.9
-
-- **Pantau LIVE**: cukup username TikTok — komentar real-time tanpa unduh video.
-- **Username tersimpan**: chip username, 1 tap untuk pantau ulang (tersimpan permanen).
-- **Bacakan komentar (TTS)**: pakai suara TTS HP, pilih suara (Indonesia diutamakan),
-  anti-menumpuk saat live ramai.
-- **Tab Audio** (baru):
-  - 🎵 **Musik**: putar MP3 dari HP (tombol MP3/Folder), tersimpan permanen di
-    aplikasi & dimuat otomatis, prev/play/next.
-  - 🎤 **Mikrofon**: suara mic langsung ke speaker HP (awas feedback).
-  - 🎧 **Volume**: slider Suara komentar / Musik / Mikrofon.
-  - 📋 **Log**: panel log aktivitas aplikasi.
-- Status koneksi, durasi pantau, statistik penonton & komentar, cari komentar.
-
-## Struktur repo
+## Arsitektur (2 komponen terpisah)
 
 ```
-tikchat-android/
-├── backend/                  # Backend Go (pantau TikTok LIVE + serve WebUI)
-│   ├── *.go                  # tiktok.go, server.go, saved.go, dns.go, main.go
-│   └── webui/                # WebUI (index.html, app.js, style.css, ...)
-├── android/                  # Proyek Android (Gradle)
-│   ├── app/src/main/
-│   │   ├── java/com/tikchat/app/
-│   │   │   ├── MainActivity.kt    # WebView + izin + file chooser
-│   │   │   ├── BackendService.kt  # Foreground service: jalankan biner Go
-│   │   │   └── TtsBridge.kt       # window.AndroidTTS (WebView tak punya speechSynthesis)
-│   │   ├── res/                   # layout, theme, ikon
-│   │   └── assets/arm64-v8a/      # <-- biner Go ditaruh CI di sini (git-ignored)
-│   └── gradlew
-└── .github/workflows/build-apk.yml
+[HP - trafik aplikasi sendiri, TCP]
+    |
+    | cgroup/connect hook (eBPF)  <-- KOMPONEN 1 (kit ini)
+    | belokkan -> 127.0.0.1:redir-port
+    | SO_ORIGINAL_DST dipalsukan via cgroup/getsockopt
+    v
+[mihomo redir-port] --> routing normal --> proxy / direct
+
+[Hotspot - klien tethering]
+    |
+    | TC ingress di ap0 (PR #3175)  <-- KOMPONEN 2 (sudah di binary)
+    v
+[mihomo tproxy-port]
+
+[HP - UDP] --> iptables TPROXY (tetap, cgroup-eBPF TCP saja)
 ```
 
-## Cara kerja APK
+## Komponen 1: ebpf-cgroup (kit ini)
 
-1. `BackendService` (foreground service) mengekstrak biner Go dari assets lalu
-   menjalankannya: `tikchat -daemon -datadir <app-files>/data` → listen di
-   `127.0.0.1:5658`.
-2. `MainActivity` menunggu backend siap lalu memuat WebUI di WebView.
-3. TTS komentar memakai `TtsBridge` native (`window.AndroidTTS`) karena WebView
-   tidak mendukung `speechSynthesis`.
-4. Mic → speaker dan pemutar MP3 memakai Web Audio API di WebView
-   (izin mic & file chooser ditangani aplikasi).
+Package Go `listener/ebpfcgroup/` + BPF C `ebpf/redirect.c`, terintegrasi
+native ke mihomo sebagai seksi config:
 
-## Build di GitHub (disarankan)
-
-1. Push repo ini ke GitHub.
-2. Buka tab **Actions** → workflow **Build TikChat APK** jalan otomatis
-   (atau tekan **Run workflow**).
-3. Download artifact **tikchat-v1.4.9-apk** → install di HP
-   (debug build, cukup untuk pemakaian pribadi).
-
-Workflow: build backend Go (`GOOS=android GOARCH=arm64`) → taruh di
-`android/app/src/main/assets/arm64-v8a/tikchat` → `./gradlew assembleDebug`.
-
-## Build lokal (opsional)
-
-Butuh: Go ≥ 1.23, JDK 17, Android SDK (platform 34, build-tools 34).
-
-```sh
-# 1. Backend
-cd backend
-GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
-  go build -trimpath -ldflags="-s -w -X main.appVersion=v1.4.9" \
-  -o ../android/app/src/main/assets/arm64-v8a/tikchat .
-
-# 2. APK
-cd ../android
-./gradlew assembleDebug
-# hasil: app/build/outputs/apk/debug/app-debug.apk
+```yaml
+ebpf-cgroup:
+  enable: true
+  redir-port: 7891        # harus sama dengan redir-port mihomo
+  # cgroup-path: /sys/fs/cgroup   # opsional, default /sys/fs/cgroup
 ```
 
-## Catatan
+Cara kerja BPF:
+- `cgroup/connect4` & `connect6`: intersep TCP connect() dari aplikasi
+  (UID != 0, bukan loopback). Simpan tujuan asli di map LRU
+  (key = socket cookie), belokkan ke 127.0.0.1:redir-port.
+- `cgroup/getsockopt`: saat mihomo redir-port tanya SO_ORIGINAL_DST,
+  kembalikan tujuan asli dari map. Kernel di-skip (return 0).
+- Bypass: UID 0 (root: mihomo & loader sendiri, cegah loop),
+  127.0.0.0/8, ::1, dan non-TCP.
 
-- Username tersimpan & data backend ada di penyimpanan privat aplikasi
-  (`/data/data/com.tikchat.app/files/data`) — ikut terhapus saat uninstall.
-- Lagu MP3 tersimpan di IndexedDB WebView (privat aplikasi).
-- Aplikasi harus tetap berjalan (foreground) agar pantauan live tidak mati.
-- Hanya arm64 yang didukung (biner Go di-build untuk `arm64-v8a`).
+## Komponen 2: ebpf PR #3175 (hotspot)
+
+Sudah ada di binary (merge otomatis oleh workflow). Aktifkan via:
+
+```yaml
+ebpf:
+  enable: true
+  lan-interface: ["ap0"]   # HARUS ada; hotspot wajib nyala
+  tproxy-port: 15359
+```
+
+CATATAN: kalau hotspot mati (ap0 hilang), mihomo GAGAL START.
+Untuk HP harian, hotspot lebih aman tetap via iptables tproxy.
+
+## Cara pasang ke fork
+
+Lihat `apply-ebpf-cgroup.sh`, atau full-otomatis via workflow
+`.github/workflows/build-android-arm64.yml` (butuh clang di runner
+untuk compile BPF — sudah termasuk di workflow).
+
+## Cara tes (di HP, sebagai root)
+
+1. Pastikan mihomo config punya `redir-port` (mis. 7891) dan
+   `ebpf-cgroup.enable: true`.
+2. Jalankan mihomo, cek log: tidak ada error "ebpf-cgroup".
+3. Cek program ter-attach:
+   ```
+   ls /sys/fs/cgroup/            # pastikan cgroup v2
+   bpftool prog show 2>/dev/null | grep -i cg_
+   ```
+   (bpftool biasanya tidak ada di HP; alternatif: cek log kernel
+   `dmesg | grep -i bpf` setelah connect aplikasi.)
+4. Tes fungsional: buka aplikasi (bukan browser sistem), cek di
+   zashboard/connections — koneksinya harus tercatat dengan tujuan
+   ASLI (bukan 127.0.0.1). Itu bukti SO_ORIGINAL_DST palsu bekerja.
+5. Tes bypass: koneksi mihomo sendiri ke server proxy harus tetap
+   jalan (tidak loop).
+
+## Jika gagal
+
+Kemungkinan penyebab, berurutan:
+1. **SELinux menolak syscall BPF** — cek `dmesg | grep -i avc`.
+   Ini penolakan paling umum di Android.
+2. **Bukan cgroup v2** — cek `mount | grep cgroup`, sesuaikan
+   `cgroup-path`.
+3. **Verifier menolak program** — cek `dmesg`, kirim lognya.
+4. **UID mihomo bukan 0** — sesuaikan bypass di redirect.c.
+
+Kirim log error ke pengembang untuk iterasi berikutnya.

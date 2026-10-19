@@ -1,0 +1,66 @@
+name: Build mihomo android-arm64 + eBPF (PR #3175 + ebpf-cgroup)
+
+# Kit ebpf-cgroup: inbound eBPF cgroup untuk trafik HP sendiri (TCP),
+# memberi makan redir-port mihomo via SO_ORIGINAL_DST palsu.
+#
+# Cara pakai:
+# 1. Fork MetaCubeX/mihomo, taruh SEMUA isi kit ebpf-cgroup-kit/ di root
+#    fork (file .yml ini ke .github/workflows/).
+# 2. Push, lalu Actions -> workflow ini -> Run workflow.
+# 3. Download binary dari Artifacts.
+#
+# Alur: checkout v1.19.32 -> merge PR #3175 -> apply ebpf-cgroup
+#       -> compile BPF (clang) -> build android-arm64.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge PR #3175 (eBPF gateway) ke v1.19.32
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+          git remote add upstream https://github.com/MetaCubeX/mihomo.git
+          git fetch upstream pull/3175/head:pr-ebpf
+          git fetch upstream tag v1.19.32 --no-tags
+          git checkout -B ebpf-build v1.19.32
+          git merge --no-edit pr-ebpf
+
+      - name: Pasang ebpf-cgroup (cgroup redirector utk trafik HP)
+        run: |
+          chmod +x apply-ebpf-cgroup.sh
+          ./apply-ebpf-cgroup.sh
+
+      - name: Install clang (untuk compile BPF)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang
+
+      - name: Compile BPF C -> bytecode
+        run: |
+          clang -O2 -target bpf -c listener/ebpfcgroup/ebpf/redirect.c \
+            -o listener/ebpfcgroup/ebpf/redirect.bpf.o
+          ls -la listener/ebpfcgroup/ebpf/
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build android-arm64
+        run: |
+          CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -trimpath \
+            -ldflags "-s -w" -o mihomo-android-arm64 .
+          ls -la mihomo-android-arm64
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-android-arm64-ebpfcgroup
+          path: mihomo-android-arm64
